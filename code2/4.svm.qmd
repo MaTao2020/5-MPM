@@ -1,0 +1,213 @@
+---
+title: "svm"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidymodels)
+library(themis)
+```
+
+```{r}
+library(future)
+plan(multisession, workers=8)
+nbrOfWorkers() 
+```
+
+```{r}
+
+train_data <- readxl::read_excel('cohort1.xlsx')
+test_data <- readxl::read_excel('cohort2.xlsx')
+
+```
+
+```{r}
+train_data <- train_data %>%
+  mutate(TRG=case_when(TRG %in% c(0,1,2)~ 'R',
+                       TRG == 3~ 'NR'),
+         TRG = as.factor(TRG))
+
+test_data <- test_data %>%
+  mutate(TRG=case_when(TRG %in% c(0,1,2)~ 'R',
+                       TRG == 3~ 'NR'),
+         TRG = as.factor(TRG))
+
+
+test_data <- test_data %>% 
+  select(colnames(train_data))
+
+```
+
+```{r}
+set.seed(123)
+```
+
+## recipe
+
+```{r}
+train_data_recipe <- 
+  recipe(TRG ~ PGE2+Tryptophan+Histidine+Arginine+Citrulline, data = train_data) %>% 
+  step_smote(TRG, 
+             over_ratio = 1, 
+             neighbors = 3) %>% 
+  step_log(c('PGE2','Tryptophan','Histidine','Arginine','Citrulline')) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors())
+
+train_data_recipe
+```
+
+## models
+
+```{r}
+
+svm_spec <- svm_rbf(
+  cost = tune(),       
+  rbf_sigma = tune()    
+) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("classification")
+
+```
+
+
+```{r}
+svm_grid <- grid_regular(
+  cost(range = c(-2, 2)),      # 10^-2 to 10^2
+  rbf_sigma(range = c(-3, 0)), # 10^-3 to 10^0
+  levels = 3)
+svm_grid
+```
+
+
+```{r}
+cv_folds <- vfold_cv(
+  data = train_data, 
+  v = 5, 
+  repeats = 5,
+  strata = TRG)
+
+```
+
+## workflow
+
+```{r}
+
+svm_workflow <- workflow() %>%
+  add_recipe(train_data_recipe) %>%
+  add_model(svm_spec)
+
+tune_results <- 
+  svm_workflow %>% 
+  tune_grid(
+    resamples = cv_folds,
+    grid = svm_grid,
+    metrics = metric_set(roc_auc, accuracy, sens, spec,f_meas,npv,ppv,recall,mcc,kap),
+    control = control_grid(save_pred = TRUE, verbose = TRUE))
+
+```
+
+```{r}
+tune_results %>% collect_metrics()
+```
+
+```{r}
+
+show_best(tune_results, metric = "roc_auc")
+
+```
+
+```{r}
+
+best_params <- select_best(tune_results, metric = "roc_auc")
+best_params
+```
+
+```{r}
+
+cv_results <- tune_results %>% 
+  collect_metrics() %>% 
+  filter(cost ==0.25 & .config=='Preprocessor1_Model4' )
+cv_results
+write.csv(cv_results,file = 'svm_models/svm_cv_results.csv')
+
+```
+
+```{r}
+final_workflow <- svm_workflow %>% 
+  finalize_workflow(best_params)
+
+```
+
+```{r}
+final_fit <- final_workflow %>% 
+  fit(data = train_data)
+
+```
+
+```{r}
+test_pred <- predict(final_fit, new_data = test_data)  
+test_prob <- predict(final_fit, new_data = test_data, type = "prob")
+
+```
+
+```{r}
+test_results <- test_data %>%
+  select(TRG) %>%
+  bind_cols(test_pred, test_prob)
+test_results
+```
+
+
+```{r}
+test_results <- test_results %>% 
+  mutate(TRG = as.factor(TRG))
+
+```
+
+
+
+```{r}
+
+test_ci <- test_data %>%
+  bootstraps(times = 1000) %>%
+  mutate(
+    metrics = map(splits, ~ {
+    preds <- augment(final_fit, new_data = analysis(.x))
+    list(
+    accuracy = accuracy(preds,truth = TRG,estimate = .pred_class),
+    mcc = mcc(preds,truth = TRG,estimate = .pred_class),
+    f_meas = f_meas(preds,truth = TRG,estimate = .pred_class),
+    ppv = ppv(preds,truth = TRG,estimate = .pred_class),
+    roc_auc = roc_auc(preds,truth = TRG,.pred_NR),
+    npv = npv(preds,truth = TRG,.pred_class),
+    sens = sens(preds,truth = TRG,estimate = .pred_class),
+    spec = spec(preds,truth = TRG,estimate = .pred_class),
+    recall= recall(preds,truth = TRG,estimate = .pred_class)) %>% 
+    map_dfr(as_tibble)
+  })) %>%
+unnest(metrics)
+
+
+ci <- test_ci %>%
+  group_by(.metric) %>%
+  summarise(
+    mean = mean(.estimate),
+    se = sd(.estimate) / sqrt(n()),
+    lower = mean - 1.96 * se,
+    upper = mean + 1.96 * se,
+    .groups = "drop")
+
+ci
+
+```
+
+```{r}
+write.csv(ci,file = 'svm_models/svm_test_results.csv')
+```
+
+```{r}
+save(list = ls(),file = 'svm_models/svm.Rdata')
+```
+
